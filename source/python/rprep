@@ -1,0 +1,314 @@
+#!/usr/bin/python3
+#############################################################################################################
+# RPREP: Ribosomal Profiling Reports, an open-source cloud-enabled framework for reproducible
+# Ribosomal Profiling data processing, analysis, and result reporting
+# 
+# https://github.com/emmesgit/RPREP
+#
+# Copyright (C) 2020 The Emmes Company L.L.C. 
+# 
+# This program is free software that contains third party software subject to various licenses, 
+# namely, the GNU General Public License version 3 (or later), the GNU Affero General Public License 
+# version 3 (or later), and the LaTeX Project Public License v.1.3(c). A list of the software contained 
+# in this program, including the applicable licenses, can be accessed here: 
+# 
+# https://github.com/emmesgit/RPREP/blob/master/SOFTWARE.xlsx  
+# 
+# You can redistribute and/or modify this program, including its components, only under the terms of 
+# the applicable license(s).  
+#
+# To cite this software, please reference <DOI>
+#
+# This program is distributed in the hope that it will be useful, but "as is," WITHOUT ANY WARRANTY; 
+# without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
+#
+# Program:  rprep
+# Version:  RPREP 1.0.0
+# Author:   Travis L. Jensen, Johannes B. Goll, Sami R. Cherikh, and William F. Hooper
+# Purpose:  Python program to run snakemake workflow, analysis, and reporting steps for RPREP
+# Input:    N/A
+# Output:   N/A
+#############################################################################################################
+
+import argparse
+import os
+import subprocess
+import multiprocessing
+import sys
+import snakemake 
+import psutil
+import shutil
+import logging
+import select
+import utils  
+import setup 
+
+## Get get RPREP directory
+scriptdir = os.path.dirname(os.path.realpath(__file__)) + '/../..'
+
+
+
+############
+# Metadata #
+############
+
+__author__    = 'William Hooper'
+__copyright__ = 'Copyright (C) 2018 The Emmes Corporation'
+__credits__   = ['Travis L. Jensen', 'Johannes B. Goll']
+__licesnse__  = 'GPL'
+__version__   = '0.3.0'
+__maintainer  = 'William Hooper'
+__email__     = 'whooper@emmes.com'
+__status__    = 'Development'
+
+
+
+################################
+# Parse command line arguments #
+################################
+
+parser = argparse.ArgumentParser(prog="RPREP " + __version__)
+parser.add_argument('-P','--run-preprocessing', help='Run pre-processing', action='store_true', default=False)
+parser.add_argument('-A','--run-analysis',      help='Run analysis', action='store_true', default=False)
+parser.add_argument('-I','--ion-torrent',       help='Attempt to remap reads unmapped by HISAT2 during pre-processing with Bowtie2', action='store_true', default=False)
+parser.add_argument('-@','--threads',           help='Number of threads to use. If more threads are specified than on the machine, all threads on the current machine are used', default=1)
+parser.add_argument('-R','--report',            help='Generate report from analysis results', action='store_true')
+parser.add_argument('-c','--config',            help='Path to XLSX configuration file.', default='check_string_for_empty')
+parser.add_argument('-l','--log',               help='Log file to write to.  The log MUST be printed in the RPREP directory (ex=/home/repuser/RPREP/run_log.txt).', default='rprep.log')
+parser.add_argument('-a','--assay',             help='Assay type', action='store', choices=['ribosomal_profiling','rna_seq'], default='ribosomal_profiling')
+parser.add_argument('-F','--force-rerun',       help='Force re-run of preprocessing', action='store_true', default=False)
+parser.add_argument('-s','--setup',             help='Re-run setup to update analytical components to the latest version of RSEQREP', action='store_true', default=False)
+parser.add_argument('-v','--version',           help='Print the RPREP version and exit', action='store_true', default=False)
+parser.add_argument('-q','--quiet',             help='Only print warnings and errors', action='store_true', default=False)
+parser.add_argument('-d','--debug',             help='Print debug messages', action='store_true', default=False)
+parser.add_argument('--save-int-local-files',   help='Save all intermediate workflow files locally (includes CRAM , fastqc, intermediate rseqc files).', action='store_true', default=False)
+parser.add_argument('--gene-body-coverage',     help='Compute gene body coverage', action='store_true', default=False)
+parser.add_argument('-s3','--archive-to-s3',    help='Archive preprocessing results to the specified AWS S3 bucket', default='check_string_for_empty')
+parser.add_argument('--rm-local',               help='Delete local alignments upon successful preprocessing completion', action='store_true', default=False)
+parser.add_argument('--encrypt-local',          help='Encrypt local preprocessing files upon completion. Requires the specification of an encryption key in the configuration file.', action='store_true', default=False)
+parser.add_argument('--unlock',                 help='Unlock working directory in the case of a kill signal or power loss', action='store_true', default=False)
+
+args = parser.parse_args()
+
+
+
+##################
+# Version output #
+##################
+
+if args.version:
+    ## Print RPREP version
+    print('RPREP ' + __version__)
+    
+    ## Print RSEQREP version if setup has been run
+    if (os.path.isfile(scriptdir+'/.setup_complete')):
+        version_file = scriptdir+'/source/rseqrep/.version'
+        
+        with open(version_file) as f:
+            rseqrep_version = f.read()
+        
+        print('RSEQREP '+rseqrep_version)
+        
+    exit(0)
+
+
+
+#####################
+# Configure logging #
+#####################
+
+if args.quiet:
+    log_level = logging.WARNING
+elif args.debug:
+    log_level = logging.DEBUG
+else:
+    log_level = logging.INFO
+
+logging.basicConfig(level=log_level, 
+                    format='[rprep] %(asctime)s - %(levelname)s - %(message)s', 
+                    datefmt='%m/%d/%Y %I:%M:%S %p',
+                    handlers=[logging.FileHandler(args.log),
+                              logging.StreamHandler(sys.stdout)])
+
+## Get absolute path of log so snakemake can write to it 
+if os.path.dirname(args.log) == '':
+    args.log = os.getcwd() + '/' + args.log
+else:
+    args.log = os.path.abspath(os.path.dirname(args.log)) + '/' + os.path.basename(args.log)
+
+
+
+##########################################
+# Exit if we aren't given anything to do #
+##########################################
+
+if not args.setup and args.config=='check_string_for_empty':
+    logging.error('Either the setup flag or a configuration file must be supplied. Run rprep --help for more information.')
+    exit(1)
+
+
+
+#################
+# Setup/update  #
+#################
+
+## Run setup if this is the first time this program is run, or if setup flag is specified
+setup_complete = scriptdir+'/.setup_complete'
+
+if not os.path.isfile(setup_complete) or args.setup:
+    setup.setup(scriptdir)
+    utils.touch(setup_complete)
+
+if args.setup and args.config=='check_string_for_empty':
+    exit(0)
+    
+
+
+########################
+# Parse configuration  #
+########################
+
+config_parser = scriptdir + '/source/r/parse-configuration.r'
+cmd = 'Rscript ' + config_parser + ' ' + args.config + ' ' + scriptdir + '/source' + ' ' + scriptdir + '/masking-sequences/rrna.fa' + ' ' + args.assay
+
+try:
+    utils.logging_call(cmd, shell=True)
+except subprocess.CalledProcessError:
+    logging.error('Configuration parsing failed. See above for more details.')
+    exit(1)
+
+
+
+############################
+# Grab config directories  #
+############################
+
+f               = open(scriptdir+'/dir.csv')
+predir          = f.readline().strip()
+reportdir       = f.readline().strip()
+pre_yaml_config = f.readline().strip()
+sample_metadata = f.readline().strip()
+f.close()
+shutil.copy2(scriptdir+'/dir.csv',scriptdir+'/source/rseqrep')
+
+
+stage1dir = predir+'/stage1'
+datadir   = reportdir+'/data/'+args.assay
+
+
+
+
+####################################
+# Run selected workflow components #
+####################################
+
+## Keep track of pre-processing completion. If a run fails, consider pre-processing incomplete
+preprocessing_complete = predir+'/.preprocessing_complete'
+
+## Preprocessing 
+if args.run_preprocessing or args.force_rerun:
+    ## Stage 1 
+    logging.info('Starting pre-processing Stage 1')
+    stage1_success = snakemake.snakemake(snakefile=scriptdir+'/source/snakemake/stage1/Snakefile.sh', 
+                                        cores=int(args.threads), 
+                                        unlock=args.unlock,
+                                        force_incomplete=True,
+                                        workdir=predir+'/stage1',
+                                        config={'srcdir':scriptdir+'/source', 
+                                                'assay'     :args.assay, 
+                                                'log_level' :log_level,
+                                                'log_file'  :args.log,
+                                                'archive'   :args.archive_to_s3,
+                                                'encrypt'   :args.encrypt_local,
+                                                'datadir'   :datadir,
+                                                'saveintlocalfiles' :args.save_int_local_files,
+                                                'ncores' :args.threads},
+                                        forceall=args.force_rerun,
+                                        log_handler=utils.logHandler,
+                                        quiet=args.quiet,
+                                        notemp=(args.save_int_local_files))
+    
+    
+    ## Stage 2
+    if stage1_success:
+        logging.info('Pre-processing Stage 1 completed. Starting Stage 2')
+        stage2_success = snakemake.snakemake(snakefile=scriptdir+'/source/snakemake/stage2/Snakefile.sh',
+                                              cores=int(args.threads),
+                                              unlock=args.unlock,
+                                              force_incomplete=True,
+                                              workdir=predir+'/stage2',
+                                              config={'srcdir'     :scriptdir+'/source', 
+                                                      'assay'      :args.assay,
+                                                      'stage1dir'  :stage1dir, 
+                                                      'datadir'    :datadir,
+                                                      'iontorrent' :args.ion_torrent,
+                                                      'log_level'  :log_level,
+                                                      'archive'    :args.archive_to_s3,
+                                                      'encrypt'    :args.encrypt_local,
+                                                      'genebodycoverage' :args.gene_body_coverage,
+                                                      'log_file'   :args.log,
+                                                      'saveintlocalfiles' :args.save_int_local_files,
+                                                      'ncores' :args.threads},
+                                              forceall=args.force_rerun,
+                                              log_handler=utils.logHandler,
+                                              quiet=args.quiet,
+                                              notemp=(args.save_int_local_files))
+    else:
+        if os.path.isfile(preprocessing_complete):
+            os.remove(preprocessing_complete)
+        exit(1)
+
+    if stage2_success:
+        logging.info('Pre-processing Stage 2 completed')
+        utils.touch(preprocessing_complete)
+    else:
+          if os.path.isfile(preprocessing_complete):
+              os.remove(preprocessing_complete)
+
+
+
+## Analysis
+if args.run_analysis and os.path.isfile(preprocessing_complete):
+    logging.info('Starting analysis')
+    
+    cmd = 'bash '+scriptdir+'/source/rseqrep/run-analysis.sh'
+    
+    try:
+        utils.logging_call(cmd, shell=True)
+    except subprocess.CalledProcessError:
+        logging.error('Analysis failed. See above for more details.')
+        os.remove(scriptdir+'/dir.csv')
+        exit(1)
+    
+    logging.info('Analysis completed')
+        
+    os.remove(scriptdir+'/source/rseqrep/dir.csv')
+    
+elif args.run_analysis and not os.path.isfile(preprocessing_complete):
+    logging.error('Pre-processing must be completed before running an analysis')
+    
+    
+    
+## Reporting
+if args.report:
+    logging.info('Generating report')
+    
+    cmd = 'bash '+scriptdir+'/source/shell/run-report.sh '+reportdir+' '+scriptdir
+    
+    try:
+        utils.logging_call(cmd, shell=True)
+    except subprocess.CalledProcessError:
+        logging.error('Reporting failed. See above for more details.')
+        os.remove(scriptdir+'/dir.csv')
+        exit(1)
+
+
+
+###########
+# Cleanup #
+###########
+
+try:
+    os.remove(scriptdir+'/dir.csv')
+except FileNotFoundError:
+    pass
